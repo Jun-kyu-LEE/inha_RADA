@@ -1,0 +1,107 @@
+# config/thresholds.yaml — 11 raw + 3카테고리 룰 (D/A/B)
+# ─────────────────────────────────────────────────────────────────
+
+final_risk_threshold: 0.6
+
+scoring_weights:
+  ml_ensemble: 0.6
+  rule_based:  0.4
+
+cold_start_rule_threshold: 0.6
+
+ml_risk_mapping:
+  base:          0.5
+  anomaly_scale: 2.0
+  normal_scale:  0.5
+
+rule_based_flag_threshold: 0.3
+
+flat_usage:
+  class:
+    mean_threshold: 55.0
+    cv_threshold:   0.04
+    weight:         0.25
+  free:
+    mean_threshold: 20.0
+    cv_threshold:   0.10
+    weight:         0.60
+
+feedback:
+  threshold_total:  10
+  threshold_per_pc: 3
+
+flag_weights:
+  GPU_MINING:            0.75
+  CPU_ONLY_MINING:       0.70
+  CONFIRMED_MINING:      0.80
+
+  GPU_CPU_IMBALANCE:     0.35
+  CPU_GPU_IMBALANCE:     0.30
+  HIGH_GPU:              0.25
+  HIGH_CPU:              0.20
+
+  POOL_TRAFFIC:          0.45
+  OUTBOUND_DOMINANT:     0.30
+  STRATUM_PATTERN:       0.25
+  HIGH_OUTBOUND:         0.20
+  MANY_EXTERNAL:         0.20
+  network_cap:           0.60
+
+  Flat_Usage:            0.60
+
+default_rules:
+  cpu_percent:              90
+  gpu_percent:              85
+  outbound_mb:              80
+  external_packet_count:    100
+  ext_traffic_complex:      1000
+  traffic_ratio_min:        5.0
+  outbound_dominant_min_mb: 5
+
+  gpu_mining_gpu_min:       70
+  gpu_mining_ratio_max:     0.30
+  gpu_imbalance_gpu_min:    50
+  cpu_gpu_ratio_min:        0.30
+
+  cpu_only_gpu_max:         10
+  cpu_only_cpu_min:         70
+  cpu_only_outbound_min:    20
+
+  stratum_ext_min:          50
+  stratum_outbound_max:     5
+  stratum_ratio_min:        30
+
+class_slot:
+  ensemble_threshold: -0.05
+  rules:
+    cpu_percent:              90
+    gpu_percent:              85
+    outbound_mb:              100
+    external_packet_count:    120
+    ext_traffic_complex:      2000
+    traffic_ratio_min:        8.0
+    gpu_mining_gpu_min:       80
+    gpu_mining_ratio_max:     0.25
+    cpu_only_cpu_min:         80
+    cpu_only_outbound_min:    30
+    stratum_ext_min:          80
+    stratum_outbound_max:     5
+    stratum_ratio_min:        40
+
+free_slot:
+  ensemble_threshold: -0.20
+  rules:
+    cpu_percent:              60
+    gpu_percent:              30
+    outbound_mb:              20
+    external_packet_count:    30
+    ext_traffic_complex:      300
+    traffic_ratio_min:        2.0
+    gpu_mining_gpu_min:       50
+    gpu_mining_ratio_max:     0.40
+    cpu_only_gpu_max:         5
+    cpu_only_cpu_min:         50
+    cpu_only_outbound_min:    8
+    stratum_ext_min:          20
+    stratum_outbound_max:     5
+    stratum_ratio_min:        15

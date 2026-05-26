@@ -3,7 +3,7 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    RADA_POLICY_DIR=/app/ml_server/config_yaml
+    RADA_POLICY_DIR=/app/ml_server/config
 
 WORKDIR /app
 

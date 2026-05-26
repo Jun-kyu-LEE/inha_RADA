@@ -14,8 +14,6 @@ class GpuMetrics(BaseModel):
     sm_utilization:     Optional[float] = None
     tensor_core_active: Optional[int]   = None
     power_draw_w:       Optional[float] = None
-    # NVML sub-field 별 실패 사유 — partial failure 가 silent zero 로 잠기는 것 방지.
-    gpu_partial_failure_reasons: Optional[List[str]] = None
 
 
 class MetricsRequest(BaseModel):

@@ -27,7 +27,6 @@ services:
       dockerfile: ml_server/Dockerfile
     container_name: rada-ml
     environment:
-      RADA_POLICY_DIR: /app/ml_server/config_yaml
       TZ: Asia/Seoul
     ports:
       - "8000:8000"

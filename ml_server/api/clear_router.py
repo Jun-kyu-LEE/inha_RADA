@@ -1,13 +1,8 @@
-"""DELETE /history/{pc_id} — 히스토리 초기화.
-
-내부 (127.0.0.1) 바인딩만으로는 같은 호스트의 잘못된 호출을 막을 수 없어
-`RADA_ADMIN_TOKEN` 설정 시 `X-Admin-Token` 헤더 인증을 요구한다.
-"""
-from fastapi import APIRouter, Depends
+"""DELETE /history/{pc_id} — 히스토리 초기화."""
+from fastapi import APIRouter
 
 from ..storage import pc_history_store, score_history_store, model_store
 from ..retrieval import clear_pc as retrieval_clear_pc
-from .admin_auth import require_admin_token
 
 router = APIRouter()
 
@@ -15,7 +10,7 @@ router = APIRouter()
 _SLOTS = ("class", "free")
 
 
-@router.delete("/history/{pc_id}", dependencies=[Depends(require_admin_token)])
+@router.delete("/history/{pc_id}")
 def clear_history(pc_id: str):
     found = False
 
