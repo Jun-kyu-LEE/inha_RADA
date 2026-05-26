@@ -34,6 +34,12 @@ Thumbs.db
 .agent_queue.jsonl
 .agent_queue.jsonl.tmp
 
+# Pre-refactor ML server backup (kept locally, not committed)
+ml_server.bak/
+
+# E2E test report (regenerated on every run)
+tests/e2e_report.md
+
 # Temporary debug helpers + eval result snapshots under tools/.
 tools/_dbg_*.py
 tools/_*.json
