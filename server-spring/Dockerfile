@@ -8,7 +8,8 @@ COPY gradle gradle
 COPY settings.gradle build.gradle ./
 COPY src src
 
-RUN chmod +x gradlew \
+RUN sed -i 's/\r$//' gradlew \
+ && chmod +x gradlew \
  && ./gradlew --no-daemon clean bootJar -x test
 
 # --- runtime stage ---
