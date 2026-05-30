@@ -1,7 +1,22 @@
-"""POST /analyze — 메인 분석 엔드포인트."""
+"""POST /analyze — 메인 분석 엔드포인트.
+
+[F-ML+rule 채택] 탐지 코어를 ml_server2 의 rule_based + ML 앙상블 + scoring
+조합으로 교체. Spring 측 입력(MetricsRequest)·응답(MlResponse) 계약은 그대로.
+
+응답 키 매핑:
+  · ml_server2 anomaly_types / rule_score / ml_risk / total_risk
+    → 본 라우터에서 verdict / overall_severity / alerts / scores 로 합성
+  · retrieval_evidence, agent, global_hw_degradation 은 기존과 동일
+
+verdict 매핑 (total_risk 기반):
+  ≥ 0.85  : HIGH_RISK   (overall_severity = HIGH)
+  ≥ 0.60  : SUSPICIOUS  (overall_severity = MEDIUM)
+  ≥ 0.30  : OBSERVE     (overall_severity = LOW — inha 호환)
+  그 외   : NORMAL
+"""
 import datetime
 import time as _time
-from typing import Any
+from typing import Any, Dict, List
 import numpy as np
 from fastapi import APIRouter
 
@@ -9,12 +24,15 @@ from ..config import get_timetable_slot
 from ..feature.feature_builder import make_snapshot
 from ..model.requests import MetricsRequest
 from ..storage import pc_history_store
-from ..scheduler.retraining_scheduler import maybe_retrain
-from ..detector.anomaly_predictor import predict_anomaly
+from ..core.inference import run_inference_snapshot
+from ..core.online_training import maybe_trigger_from_analyze, track_analyze_sample
+from ..core.trainer import train_async
+from ..compat import (
+    build_isolation_forest_block,
+    enrich_scores_for_inha,
+    normalize_verdict_severity,
+)
 from ..detector.global_degradation import detect_global_hw_degradation
-from ..scorer.verdict_classifier import analyze_pattern
-from ..scorer import pattern_categories, category_gating
-from ..policy import get_scoring_policy
 from ..agent.runner import run_ai_agent
 from ..retrieval import (
     build_segment,
@@ -25,6 +43,83 @@ from ..retrieval import (
 )
 
 router = APIRouter()
+
+POLICY_VERSION = "ml-rule-v1.0"
+
+# anomaly_type → (severity, scores key) 매핑. Mining/Compute = HIGH/MEDIUM, Network = LOW.
+_ALERT_SEVERITY: Dict[str, str] = {
+    "GPU_MINING":         "HIGH",
+    "CPU_ONLY_MINING":    "HIGH",
+    "CONFIRMED_MINING":   "HIGH",
+    "GPU_CPU_IMBALANCE":  "MEDIUM",
+    "CPU_GPU_IMBALANCE":  "MEDIUM",
+    "HIGH_GPU":           "MEDIUM",
+    "HIGH_CPU":           "MEDIUM",
+    "POOL_TRAFFIC":       "HIGH",
+    "OUTBOUND_DOMINANT":  "MEDIUM",
+    "HIGH_OUTBOUND":      "LOW",
+    "MANY_EXTERNAL":      "LOW",
+    "STRATUM_PATTERN":    "HIGH",
+    "Flat_Usage":         "MEDIUM",
+    "FLAT_USAGE":         "MEDIUM",
+    "Pattern":            "MEDIUM",
+}
+
+# anomaly_type → 사람이 읽는 detail 텍스트
+_ALERT_DETAIL: Dict[str, str] = {
+    "GPU_MINING":         "GPU 고부하 + CPU/GPU 불균형 + 외부 송신 → GPU 채굴 강한 의심",
+    "CPU_ONLY_MINING":    "GPU 유휴 + CPU 고부하 + 외부 송신 → CPU(Monero) 채굴 의심",
+    "CONFIRMED_MINING":   "알려진 채굴 프로세스 실행 감지",
+    "GPU_CPU_IMBALANCE":  "GPU 부하 대비 CPU 점유가 비정상적으로 낮음",
+    "CPU_GPU_IMBALANCE":  "CPU 부하 대비 GPU 점유가 비정상적으로 낮음",
+    "HIGH_GPU":           "GPU 부하 임계 초과",
+    "HIGH_CPU":           "CPU 부하 임계 초과",
+    "POOL_TRAFFIC":       "외부 패킷 × 송신량 복합 신호 — 채굴 풀 통신 의심",
+    "OUTBOUND_DOMINANT":  "송신량이 수신량을 크게 초과 — 작업 결과 송출 패턴",
+    "HIGH_OUTBOUND":      "외부 송신량 임계 초과",
+    "MANY_EXTERNAL":      "외부 연결 패킷 수 임계 초과",
+    "STRATUM_PATTERN":    "패킷 多 + 소량 송신 — Stratum JSON-RPC 채굴 패턴",
+    "Flat_Usage":         "장시간 평탄한 고부하 — 채굴형 지속 패턴",
+    "FLAT_USAGE":         "장시간 평탄한 고부하 — 채굴형 지속 패턴",
+    "Pattern":            "ML 앙상블 기반 패턴 이상",
+}
+
+# 카테고리 게이팅용 플래그 분류 — rule_based.py 의 D/A/B 카테고리와 1:1 매핑.
+_RESOURCE_FLAGS = {
+    "GPU_MINING", "CPU_ONLY_MINING", "CONFIRMED_MINING",
+    "GPU_CPU_IMBALANCE", "CPU_GPU_IMBALANCE", "HIGH_GPU", "HIGH_CPU",
+}
+_NETWORK_FLAGS = {
+    "POOL_TRAFFIC", "OUTBOUND_DOMINANT", "HIGH_OUTBOUND",
+    "MANY_EXTERNAL", "STRATUM_PATTERN",
+}
+_SYSTEM_FLAGS = {"Flat_Usage", "FLAT_USAGE"}
+
+_VERDICT_TO_GATING = {
+    "HIGH_RISK":  "DANGEROUS",
+    "SUSPICIOUS": "SUSPICIOUS",
+    "OBSERVE":    "OBSERVE",
+    "NORMAL":     "NORMAL",
+}
+
+
+# scores 매핑 — 기존 mock_agent 가 참조하는 키 (gpu_mining/cpu_mining/...) 를 보존.
+_SCORE_KEY: Dict[str, str] = {
+    "GPU_MINING":         "gpu_mining",
+    "CPU_ONLY_MINING":    "cpu_mining",
+    "CONFIRMED_MINING":   "process",
+    "GPU_CPU_IMBALANCE":  "gpu_mining",
+    "CPU_GPU_IMBALANCE":  "cpu_mining",
+    "HIGH_GPU":           "gpu_mining",
+    "HIGH_CPU":           "cpu_mining",
+    "POOL_TRAFFIC":       "exfil",
+    "OUTBOUND_DOMINANT":  "exfil",
+    "HIGH_OUTBOUND":      "exfil",
+    "MANY_EXTERNAL":      "exfil",
+    "STRATUM_PATTERN":    "stealth",
+    "Flat_Usage":         "stealth",
+    "FLAT_USAGE":         "stealth",
+}
 
 
 def _sanitize(obj: Any) -> Any:
@@ -41,6 +136,182 @@ def _sanitize(obj: Any) -> Any:
     return obj
 
 
+def _verdict_from_risk(total_risk: float, is_anomaly: bool) -> tuple[str, str]:
+    """(verdict, overall_severity) 반환."""
+    if total_risk >= 0.85:
+        return "HIGH_RISK", "HIGH"
+    if total_risk >= 0.60 or is_anomaly:
+        return "SUSPICIOUS", "MEDIUM"
+    if total_risk >= 0.30:
+        return "OBSERVE", "LOW"
+    return "NORMAL", "NORMAL"
+
+
+def _build_alerts(infer: dict) -> List[dict]:
+    alerts: List[dict] = []
+    flag_scores = infer.get("flag_scores", {})
+    for atype in infer["anomaly_types"]:
+        alerts.append({
+            "type":     atype,
+            "severity": _ALERT_SEVERITY.get(atype, "LOW"),
+            "detail":   _ALERT_DETAIL.get(atype, f"{atype} 신호 감지"),
+            "score":    round(float(flag_scores.get(atype, 0.0)), 4),
+        })
+    return alerts
+
+
+def _build_scores(infer: dict) -> Dict[str, float]:
+    """mock_agent / claude_api_agent 가 참조하는 키 셋을 보존하며 합성."""
+    flag_scores = infer.get("flag_scores", {})
+    bucketed: Dict[str, float] = {
+        "gpu_mining": 0.0,
+        "cpu_mining": 0.0,
+        "exfil":      0.0,
+        "stealth":    0.0,
+        "dos":        0.0,
+        "mem":        0.0,
+        "process":    0.0,
+    }
+    for atype, score in flag_scores.items():
+        key = _SCORE_KEY.get(atype)
+        if key is None:
+            continue
+        bucketed[key] = max(bucketed[key], round(float(score) * 100.0, 2))
+
+    return {
+        **bucketed,
+        "final":              round(infer["total_risk"] * 100.0, 2),
+        "rule":               round(infer["rule_score"] * 100.0, 2),
+        "ml":                 round(infer["ml_risk"]    * 100.0, 2),
+        "ensemble":           infer["ensemble_score"],
+        "if_score":           infer["if_score"],
+        "context_multiplier": 1.0,
+    }
+
+
+def _build_signals(snapshot: dict, infer: dict) -> Dict[str, Any]:
+    """레거시 verdict_classifier signals 슬롯 호환."""
+    known = infer.get("known_miners") or []
+    return {
+        "is_gaming":      False,
+        "is_compiling":   False,
+        "mining_pool_ip": bool(infer.get("mining_pool_ip")),
+        "persistent_miner": len(known) > 0,
+        "known_miners":   known,
+        "anomaly_types":  infer["anomaly_types"],
+        "model_version":  infer["model_version"],
+        "ml_ready":       infer["ml_ready"],
+    }
+
+
+def _sustained_minutes(pc_id: str) -> int:
+    """pc_history 말단부터 cpu>=30 또는 gpu>=30 인 스냅샷을 연속으로 카운트.
+    클라이언트가 분 단위로 보내므로 1 snapshot ≈ 1 minute 로 본다."""
+    history = pc_history_store.pc_history.get(pc_id)
+    if not history:
+        return 0
+    streak = 0
+    for snap in reversed(history):
+        cpu = float(snap.get("cpu_percent") or 0)
+        gpu = float(snap.get("gpu_percent") or 0)
+        if cpu >= 30.0 or gpu >= 30.0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _build_category_signals(
+    infer: dict,
+    global_hw: dict,
+    pc_id: str,
+    verdict: str,
+) -> Dict[str, Any]:
+    """Spring `MlResponse.categorySignals` 계약에 맞춘 게이팅 신호 합성.
+
+    rule_based 의 D/A/B 카테고리 플래그를 resource/network/system 으로 재그룹화.
+    """
+    types = set(infer.get("anomaly_types") or [])
+    resource_abnormal = bool(types & _RESOURCE_FLAGS)
+    network_abnormal  = bool(types & _NETWORK_FLAGS)
+    system_abnormal   = bool(types & _SYSTEM_FLAGS) or bool(global_hw.get("detected"))
+
+    return {
+        "resource_abnormal":   resource_abnormal,
+        "network_abnormal":    network_abnormal,
+        "system_abnormal":     system_abnormal,
+        "sustained_minutes":   _sustained_minutes(pc_id),
+        "triggered_patterns":  list(infer.get("anomaly_types") or []),
+        "verdict_from_gating": _VERDICT_TO_GATING.get(verdict, "NORMAL"),
+    }
+
+
+def _signals_missing(snapshot: dict) -> List[str]:
+    """F5 호환 — snapshot 에서 누락된 신호 분류."""
+    missing: List[str] = []
+    if snapshot.get("gpu_percent") is None:
+        missing.append("gpu")
+    if snapshot.get("outbound_mb") is None and snapshot.get("inbound_mb") is None:
+        missing.append("network")
+    if not snapshot.get("top_processes"):
+        missing.append("process")
+    return missing
+
+
+# ── 팀원(jjaerud/wip) Spring/Grafana 계약 호환 보강 ─────────────────────────
+# MlResponse.message / evidenceMeta(P0-3) / localEvidence(P1-1) 를 채워
+# AlertService 저장 및 Grafana 패널이 공백 없이 동작하도록 한다.
+
+def _build_message(verdict: str, overall_severity: str, alerts: List[dict]) -> str:
+    """Spring `AnomalyHistory.message` 호환 — 사람이 읽는 한 줄 요약."""
+    if verdict == "NORMAL":
+        return "정상 범위 — 특이 이상 신호 없음."
+    head = {
+        "HIGH_RISK":  "위험",
+        "SUSPICIOUS": "의심",
+        "OBSERVE":    "관찰",
+    }.get(verdict, verdict)
+    top = alerts[0] if alerts else None
+    body = (top.get("detail") or top.get("type")) if top else "이상 신호 감지"
+    return f"[{head}/{overall_severity}] {body}"
+
+
+def _build_evidence_meta(
+    infer: dict, category_signals: Dict[str, Any], verdict: str,
+) -> Dict[str, Any]:
+    """Spring `MlResponse.evidenceMeta` (P0-3) 호환 — 승격 근거 메타.
+
+    내 ML 은 total_risk 직접 판정이라 별도 promotion gating 단계가 없으므로
+    promotion_gated=False 로 고정하고 활성 신호/카테고리만 보고한다.
+    """
+    active_signals = list(infer.get("anomaly_types") or [])
+    active_categories = [
+        name for name, key in (
+            ("resource", "resource_abnormal"),
+            ("network",  "network_abnormal"),
+            ("system",   "system_abnormal"),
+        ) if category_signals.get(key)
+    ]
+    known = infer.get("known_miners") or []
+    return {
+        "active_signal_count": len(active_signals),
+        "category_count":      len(active_categories),
+        "active_categories":   active_categories,
+        "active_signals":      active_signals,
+        "promotion_gated":     False,
+        "promotion_reason":    "ml_rule_direct_verdict",
+        "fast_path_match":     "mining_known" if known else None,
+    }
+
+
+def _build_local_evidence(alerts: List[dict]) -> List[dict]:
+    """Spring `MlResponse.localEvidence` (P1-1) 호환 — LOCAL_* 알림 분리.
+
+    내 파이프라인은 LOCAL_* 알림을 생성하지 않으므로 보통 빈 리스트.
+    """
+    return [a for a in alerts if str(a.get("type", "")).startswith("LOCAL_")]
+
+
 @router.post("/analyze")
 def analyze(metrics: MetricsRequest):
     pc_id = metrics.pc_id
@@ -50,26 +321,8 @@ def analyze(metrics: MetricsRequest):
     history = pc_history_store.ensure_pc_history(pc_id)
     snapshot = make_snapshot(metrics)
     history.append(snapshot)
+    track_analyze_sample(pc_id, snapshot)
     pc_history_store.update_train_history(pc_id, slot, snapshot)
-
-    # v0.6: 1분 aggregate 버퍼 (3h 윈도우) 누적
-    df = metrics.derived_features or {}
-    user_idle_ms = None
-    try:
-        if isinstance(df, dict):
-            user_idle_ms = df.get("user_idle_ms")
-    except Exception:
-        user_idle_ms = None
-    external_endpoints = [
-        c.get("ip", "") for c in (metrics.external_connections or [])
-        if isinstance(c, dict) and c.get("ip")
-    ]
-    pc_history_store.append_snapshot_for_aggregate(
-        pc_id, snapshot,
-        external_endpoints=external_endpoints,
-        user_idle_ms=user_idle_ms,
-        memory_used_gb=metrics.memory_used_gb,
-    )
 
     pc_history_store.all_pc_latest[pc_id] = {
         "cpu_percent":           metrics.cpu_percent,
@@ -85,14 +338,31 @@ def analyze(metrics: MetricsRequest):
         "_ts":                   _time.time(),
     }
 
-    # 재학습
-    maybe_retrain(pc_id, slot)
+    # ── ML+rule 추론 (단일 진입점) ────────────────────────────────────────
+    infer = run_inference_snapshot(
+        snapshot, pc_id=pc_id, timestamp=dt,
+        append_history=False,   # 위에서 이미 ensure_pc_history 에 append 했음
+        slot_override=slot,
+    )
 
-    # ML 앙상블
-    if_result = predict_anomaly(pc_id, slot, metrics)
-    ml_weighted = if_result.get("weighted_score") or 0.0
+    maybe_trigger_from_analyze(train_async)
 
-    # Retrieval evidence (segment → embedding → top-k 검색)
+    verdict, overall_severity = _verdict_from_risk(infer["total_risk"], infer["is_anomaly"])
+    overall_severity = normalize_verdict_severity(verdict, overall_severity)
+    alerts = _build_alerts(infer)
+    if infer.get("known_miners") and not any(a.get("type") == "CONFIRMED_MINING" for a in alerts):
+        names = ", ".join(
+            (m.get("name") or m.get("process_name") or "?") for m in infer["known_miners"][:3]
+        )
+        alerts.insert(0, {
+            "type":     "CONFIRMED_MINING",
+            "severity": "HIGH",
+            "detail":   f"채굴 프로세스: {names}",
+            "score":    round(float(infer.get("flag_scores", {}).get("CONFIRMED_MINING", 0.8)), 4),
+        })
+    signals = _build_signals(snapshot, infer)
+
+    # ── Retrieval evidence (segment → embedding → top-k 검색) ────────────
     current_segment = build_segment(pc_id, slot, history, window_size=12)
     retrieval_evidence = None
     current_embedding = None
@@ -104,236 +374,75 @@ def analyze(metrics: MetricsRequest):
             peer_latest=pc_history_store.all_pc_latest,
         )
 
-    # 패턴 분석
-    pattern_result = analyze_pattern(metrics, history, slot,
-                                     ml_weighted_score=ml_weighted,
-                                     retrieval_evidence=retrieval_evidence)
-    if retrieval_evidence is not None:
-        pattern_result["retrieval_evidence"] = retrieval_evidence
+    scores = enrich_scores_for_inha(
+        _build_scores(infer), infer, retrieval_evidence=retrieval_evidence,
+    )
 
-    # v0.6: 카테고리 패턴 evaluator + 게이팅
-    try:
-        policy = get_scoring_policy()
-        cat_cfg = {
-            "resource": policy.category_patterns.group("resource"),
-            "network":  policy.category_patterns.group("network"),
-            "system":   policy.category_patterns.group("system"),
-        }
-        gating_cfg = {"gating": {
-            "mining_confirmed": policy.gating.get("mining_confirmed"),
-            "suspicious":       policy.gating.get("suspicious"),
-            "observe":          policy.gating.get("observe"),
-        }}
-        # 현재 진행 중인 1분 버퍼도 즉시 보이도록 flush
-        pc_history_store.force_flush_minute_buffer(pc_id)
-        history_window = pc_history_store.get_aggregate_window(pc_id, minutes=180)
-        current_snapshot = {
-            "cpu_percent": metrics.cpu_percent,
-            "gpu_percent": metrics.gpu.load_percent if metrics.gpu else 0.0,
-            "memory_used_gb": metrics.memory_used_gb,
-        }
-        res_cat = pattern_categories.evaluate_resource_pattern(history_window, current_snapshot, cat_cfg)
-        net_cat = pattern_categories.evaluate_network_pattern(history_window, current_snapshot, cat_cfg)
-        sys_cat = pattern_categories.evaluate_system_pattern(history_window, current_snapshot, cat_cfg)
-        state = pc_history_store.get_category_state(pc_id)
-        gating_result = category_gating.evaluate(res_cat, net_cat, sys_cat, state, gating_cfg)
+    pattern_result = {
+        "overall_severity":   overall_severity,
+        "verdict":            verdict,
+        "alerts":             alerts,
+        "scores":             scores,
+        "signals":            signals,
+        "timetable_slot":     slot,
+        "policy_version":     POLICY_VERSION,
+        "retrieval_evidence": retrieval_evidence,
+    }
 
-        triggered = (
-            list(res_cat.triggered_patterns)
-            + list(net_cat.triggered_patterns)
-            + list(sys_cat.triggered_patterns)
-        )
-        # #2: stub 패턴(미구현) 중 config 에서 enabled 된 것 = "켰지만 평가 안 됨".
-        # 운영자가 조용한 미평가를 인지하도록 응답에 노출.
-        stub_status: dict = {}
-        for _c in (res_cat, net_cat, sys_cat):
-            stub_status.update(_c.detail.get("stub_status") or {})
-        enabled_but_unimplemented = [
-            name for name, st in stub_status.items()
-            if st.get("enabled") and not st.get("implemented")
-        ]
-        category_signals = {
-            "resource_abnormal":   bool(res_cat.abnormal),
-            "network_abnormal":    bool(net_cat.abnormal),
-            "system_abnormal":     bool(sys_cat.abnormal),
-            "sustained_minutes":   int(gating_result.sustained_minutes),
-            "triggered_patterns":  triggered,
-            "verdict_from_gating": gating_result.verdict,
-            "stub_patterns":              stub_status,
-            "enabled_but_unimplemented":  enabled_but_unimplemented,
-        }
-        pattern_result["category_signals"] = category_signals
-
-        # 두 경로 OR — 더 강한 verdict 채택 (verdict 순위: HIGH_RISK > SUSPICIOUS > OBSERVE > NORMAL)
-        verdict_rank = {"HIGH_RISK": 3, "SUSPICIOUS": 2, "OBSERVE": 1, "NORMAL": 0}
-        cur_v = pattern_result.get("verdict", "NORMAL")
-        gv = gating_result.verdict
-        # P0-3: category_gating 의 mining_confirmed (alert_type ==
-        # MINING_CONFIRMED_BY_BEHAVIOR) 는 promotion gating 의 fast-path
-        # "confirmed_sustained" 로 표시. evidence_meta 에 즉시 반영.
-        if gating_result.detail.get("alert_type") == "MINING_CONFIRMED_BY_BEHAVIOR":
-            em = pattern_result.get("evidence_meta") or {}
-            em["fast_path_match"] = "confirmed_sustained"
-            em["promotion_gated"] = False
-            em["promotion_reason"] = "fast_path:confirmed_sustained"
-            pattern_result["evidence_meta"] = em
-        if verdict_rank.get(gv, 0) > verdict_rank.get(cur_v, 0):
-            pattern_result["verdict"] = gv
-            sev_map = {"HIGH_RISK": "HIGH", "SUSPICIOUS": "MEDIUM", "OBSERVE": "LOW", "NORMAL": "NORMAL"}
-            new_sev = sev_map[gv]
-            cur_sev = pattern_result.get("overall_severity", "NORMAL")
-            sev_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "NORMAL": 0}
-            if sev_rank.get(new_sev, 0) > sev_rank.get(cur_sev, 0):
-                pattern_result["overall_severity"] = new_sev
-            # alert append (behavior-based)
-            alert_type = gating_result.detail.get("alert_type") or f"{gv}_BEHAVIOR"
-            pattern_result["alerts"].append({
-                "type":     alert_type,
-                "severity": new_sev if new_sev != "NORMAL" else "LOW",
-                "detail":   (f"category_gating verdict={gv} cats={gating_result.cats_count} "
-                             f"sustained_min={gating_result.sustained_minutes} "
-                             f"triggered={triggered}"),
-                "score":    0,
-            })
-    except Exception as _cat_e:
-        # fail-open: 카테고리 평가 실패는 기존 verdict 에 영향 주지 않음
-        pattern_result["category_signals"] = {
-            "resource_abnormal":   False,
-            "network_abnormal":    False,
-            "system_abnormal":     False,
-            "sustained_minutes":   0,
-            "triggered_patterns":  [],
-            "verdict_from_gating": "NORMAL",
-            "stub_patterns":              {},
-            "enabled_but_unimplemented":  [],
-            "error": str(_cat_e),
-        }
-
-    # FP-fix #1 (pilot 2026-05): network-only 약신호 cap.
-    # 네트워크 신호만 활성이고 자원/시스템 시그니처·강한 프로세스 근거가 없으면
-    # verdict 를 최대 OBSERVE 로 cap. PID 귀속 없는 EXFIL/DOS 류 FP 차단.
-    # 면제(cap 안 함): known_miner/mining_pool fast-path, Phase2 PID 귀속
-    # (external_conn_suspicious_owner), single_core_full/process_recreation,
-    # 채굴 자원 패턴(gpu_flat/cpu_flat/stealth mismatch).
-    try:
-        _sig = pattern_result.get("signals", {}) or {}
-        _NET = ("net_external_high", "persistent_ext", "outbound_spike",
-                "net_out_sustained", "spike_count_1m", "new_remote_ip_burst",
-                "dos_spike")
-        _RES_SYS = ("gpu_high", "gpu_flat", "cpu_high", "cpu_flat", "vram_low",
-                    "sm_high", "power_stable", "mem_high", "mem_critical",
-                    "stealth_mismatch_power", "stealth_mismatch_vram")
-        _net_active = any(_sig.get(k) for k in _NET)
-        _res_sys_active = any(_sig.get(k) for k in _RES_SYS)
-        _fast_path = bool(_sig.get("known_miner") or _sig.get("mining_pool_ip"))
-        _strong = bool(
-            _sig.get("external_conn_suspicious_owner")
-            or _sig.get("single_core_full") or _sig.get("process_recreation")
-        )
-        _network_only = _net_active and not _res_sys_active
-        _cur_v = pattern_result.get("verdict", "NORMAL")
-        if (_network_only and not _fast_path and not _strong
-                and verdict_rank.get(_cur_v, 0) > verdict_rank["OBSERVE"]):
-            pattern_result["verdict"] = "OBSERVE"
-            pattern_result["overall_severity"] = "LOW"
-            em = pattern_result.get("evidence_meta") or {}
-            em["network_only_capped"] = True
-            em["network_only_capped_from"] = _cur_v
-            pattern_result["evidence_meta"] = em
-    except Exception:
-        pass  # cap 실패는 기존 verdict 유지 (fail-open)
-
-    # 현재 segment 저장 (검색 이후 → 자기 자신이 top-k 에 잡히지 않음)
+    # 현재 segment 를 검색 후에 저장 → 자기 자신은 top-k 에 잡히지 않음
     if current_segment is not None and current_embedding is not None:
         try:
             add_segment(
                 current_segment, current_embedding,
-                verdict=pattern_result.get("verdict", "NORMAL"),
-                score=float(pattern_result.get("scores", {}).get("final", 0.0)),
+                verdict=verdict,
+                score=float(scores["final"]),
             )
         except Exception:
             pass
 
-    # 전체 PC 노후화 — alert 로만 첨부, overall_severity 변경 X.
-    # P0-2 (docs/fp_field_analysis_v0.6.md §7-P0-2): alert evidence 가
-    # severity 를 강제 승격하지 못한다. GLOBAL_HW_DEGRADATION 은 운영
-    # 관찰용 evidence 로만 보존.
+    # ── 전체 PC 노후화 ────────────────────────────────────────────────────
     global_hw = detect_global_hw_degradation()
     if global_hw.get("detected"):
-        pattern_result["alerts"].append({
+        alerts.append({
             "type":     "GLOBAL_HW_DEGRADATION",
             "severity": "MEDIUM",
             "detail":   global_hw["detail"],
         })
+        if overall_severity == "NORMAL":
+            overall_severity = "MEDIUM"
+            pattern_result["overall_severity"] = "MEDIUM"
 
-    # Risk-vector interpretation layer (ADDITIVE — does not alter verdict).
-    # Re-projects the same signals onto 4 axes (mining/malfunction/aging/threat)
-    # so we can validate verdict-taxonomy in production before depending on it.
-    try:
-        from ..scorer.risk_vector import compute_risk_vector
-        rv = compute_risk_vector(
-            pattern_result.get("signals", {}),
-            pattern_result.get("scores", {}),
-        )
-        scores_block = pattern_result.get("scores")
-        if isinstance(scores_block, dict):
-            scores_block["risk_vector"] = rv
-    except Exception:
-        pass  # additive layer must never break the main path
-
-    # #8: 설명 신뢰도 — signal_quality(#5) + retrieval_evidence 결합 (ADDITIVE).
-    try:
-        from ..scorer.explanation_confidence import compute_explanation_confidence
-        pattern_result["explanation_confidence"] = compute_explanation_confidence(
-            retrieval_evidence,
-            pattern_result.get("signal_quality"),
-        )
-    except Exception:
-        pass  # additive layer must never break the main path
-
-    # AI Agent
+    # ── AI Agent ─────────────────────────────────────────────────────────
     agent_result = None
-    if pattern_result["overall_severity"] != "NORMAL":
+    if overall_severity != "NORMAL":
         agent_result = run_ai_agent(metrics, pattern_result, global_hw)
+
+    iso_block = build_isolation_forest_block(
+        infer,
+        history_size=len(history),
+        metrics_boxplot=metrics.boxplot_signal,
+    )
+
+    category_signals = _build_category_signals(infer, global_hw, pc_id, verdict)
 
     return _sanitize({
         "pc_id":               pc_id,
         "timestamp":           metrics.timestamp,
         "timetable_slot":      slot,
-        "overall_severity":    pattern_result["overall_severity"],
-        "verdict":             pattern_result.get("verdict", "NORMAL"),
-        "policy_version":      pattern_result.get("policy_version", "unknown"),
-        "alerts":              pattern_result["alerts"],
-        "scores":              pattern_result.get("scores", {}),
-        "signals":             pattern_result.get("signals", {}),
+        "overall_severity":    overall_severity,
+        "verdict":             verdict,
+        "message":             _build_message(verdict, overall_severity, alerts),
+        "policy_version":      POLICY_VERSION,
+        "alerts":              alerts,
+        "scores":              scores,
+        "signals":             signals,
         "history_size":        len(history),
-        "isolation_forest":    if_result,
+        "isolation_forest":    iso_block,
         "global_hw_degradation": global_hw,
         "agent":               agent_result,
         "retrieval_evidence":  retrieval_evidence,
-        "local_evidence":      pattern_result.get("local_evidence", []),
-        "signals_missing":     pattern_result.get("signals_missing", []),
-        "signal_quality":      pattern_result.get("signal_quality", {
-            "overall": "FULL", "sources": {}, "degraded_sources": [], "reasons": {},
-        }),
-        "explanation_confidence": pattern_result.get("explanation_confidence", {
-            "level": "MEDIUM", "score": 2, "reasons": [], "inputs": {},
-        }),
-        "category_signals":    pattern_result.get("category_signals", {
-            "resource_abnormal":   False,
-            "network_abnormal":    False,
-            "system_abnormal":     False,
-            "sustained_minutes":   0,
-            "triggered_patterns":  [],
-            "verdict_from_gating": "NORMAL",
-        }),
-        "evidence_meta":       pattern_result.get("evidence_meta", {
-            "active_signal_count": 0,
-            "category_count":      0,
-            "active_categories":   [],
-            "active_signals":      [],
-            "promotion_gated":     False,
-            "promotion_reason":    "gating_disabled",
-            "fast_path_match":     None,
-        }),
+        "signals_missing":     _signals_missing(snapshot),
+        "category_signals":    category_signals,
+        "evidence_meta":       _build_evidence_meta(infer, category_signals, verdict),
+        "local_evidence":      _build_local_evidence(alerts),
     })

@@ -1,0 +1,68 @@
+# config/models.yaml
+# ─────────────────────────────────────────────────────────────────
+# 앙상블 모델 구성. weight 합계는 자동 정규화됨.
+#
+# 현재 활성: IF (0.4) + ECOD (0.3) + Mahalanobis (0.3)
+#   - ml_server2 의 benchmark_report_2026-05-14.md 결과 반영
+#   - LOF 는 dense cluster 채굴(S6 AUC 0.447)에 약해 제외
+#   - HBOS / KNN / AutoEncoder 는 정의만 두고 주석 처리 (실험 시 주석 해제)
+#
+# module 경로는 ml_server 패키지 기준 절대 경로 (ml_server.models.xxx).
+# ─────────────────────────────────────────────────────────────────
+
+ensemble:
+  - name: IsolationForestModel
+    module: ml_server.models.isolation_forest
+    class: IsolationForestModel
+    weight: 0.4
+    params:
+      contamination: 0.03
+      n_estimators: 200
+      random_state: 42
+
+  - name: ECODModel
+    module: ml_server.models.ecod
+    class: ECODModel
+    weight: 0.3
+    params: {}
+
+  - name: MahalanobisModel
+    module: ml_server.models.mahalanobis
+    class: MahalanobisModel
+    weight: 0.3
+    params:
+      ridge: 1.0e-4
+
+  # ── 실험용 (활성화하려면 주석 해제) ──────────────────────────────
+
+  # - name: LOFModel
+  #   module: ml_server.models.lof
+  #   class: LOFModel
+  #   weight: 0.2
+  #   params:
+  #     n_neighbors: 20
+  #     novelty: true
+
+  # - name: HBOSModel
+  #   module: ml_server.models.hbos
+  #   class: HBOSModel
+  #   weight: 0.2
+  #   params:
+  #     n_bins: 20
+
+  # - name: KNNModel
+  #   module: ml_server.models.knn
+  #   class: KNNModel
+  #   weight: 0.2
+  #   params:
+  #     n_neighbors: 20
+
+  # - name: AutoEncoderModel
+  #   module: ml_server.models.autoencoder
+  #   class: AutoEncoderModel
+  #   weight: 0.2
+  #   params:
+  #     hidden_layer_sizes: [16, 8, 16]
+  #     max_iter: 300
+  #     learning_rate_init: 0.001
+  #     random_state: 42

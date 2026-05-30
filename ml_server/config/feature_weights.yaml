@@ -1,0 +1,52 @@
+# config/feature_weights.yaml — ml_server2 가중치 (enabled 피처만)
+# outbound_mb / external_packet_count 는 ML 벡터에 미포함, 룰·derived 에서 사용.
+# ─────────────────────────────────────────────────────────────────
+
+enabled_raw:
+  - cpu_percent
+  - memory_percent
+  - gpu_percent
+  - gpu_vram_mb
+  - disk_read_mb
+  - disk_write_mb
+  - gpu_power_w
+
+enabled_derived:
+  - cpu_gpu_ratio
+  - gpu_minus_cpu
+  - gpu_vram_complex
+  - traffic_direction
+  - ext_traffic_complex
+  - cpu_mining_index
+
+raw_features:
+  cpu_percent:                    2.5
+  gpu_percent:                    2.5
+  gpu_power_w:                    2.5
+  gpu_vram_mb:                    1.5
+  memory_percent:                 0.8
+  disk_read_mb:                   0.1
+  disk_write_mb:                  0.1
+
+derived_features:
+  ext_traffic_complex:            2.5
+  traffic_direction:              2.5
+  cpu_mining_index:               2.5
+  cpu_gpu_ratio:                  2.0
+  gpu_minus_cpu:                  2.0
+  gpu_vram_complex:               1.5
+
+slot_multipliers:
+  class:
+    default: 0.9
+
+  free:
+    cpu_percent:         1.5
+    gpu_percent:         1.5
+    gpu_power_w:         1.5
+    cpu_gpu_ratio:       1.4
+    gpu_minus_cpu:       1.4
+    traffic_direction:   1.4
+    ext_traffic_complex: 1.5
+    cpu_mining_index:    1.4
+    default:             1.2

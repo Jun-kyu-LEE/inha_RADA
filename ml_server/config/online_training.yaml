@@ -1,0 +1,19 @@
+# config/online_training.yaml — /analyze 기반 온라인 재학습
+# ─────────────────────────────────────────────────────────────────
+# enabled: false 이면 /analyze 로 history 만 쌓고 재학습 트리거 안 함.
+# pretrain 완료 후 enabled: true 로 켜면 pretrain 캐시 + 최근 online 을 비율 맞춰 재학습.
+
+enabled: false
+
+# online 쪽: PC당 최 recent N건 (5초 주기 × 360 ≈ 30분). deque maxlen(720) 넘으면 자동 삭제.
+online_window_samples: 360
+
+# pretrain : online 비율 (합 ≠ 1 이어도 비율만 사용)
+pretrain_ratio: 0.7
+online_ratio: 0.3
+
+# pretrain subsample 상한 (비율 계산 결과가 이보다 크면 cap)
+pretrain_max_samples: 10000
+
+# 마지막 online 재학습 이후 N건(/analyze) 쌓이면 다시 트리거
+retrain_interval_samples: 360

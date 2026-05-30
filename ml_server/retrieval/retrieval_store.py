@@ -12,8 +12,6 @@ import os
 from collections import deque
 from typing import Dict, List, Deque
 
-from ..silent_fail_counters import increment as _bump_silent_fail
-
 _MAXLEN = 20000
 
 segment_history_by_slot: Dict[str, Deque[dict]] = {
@@ -48,11 +46,7 @@ def add_segment(segment: dict, embedding: List[float],
         "start_ts":   segment.get("start_ts"),
         "end_ts":     segment.get("end_ts"),
     }
-    q = _ensure_slot(slot)
-    if q.maxlen is not None and len(q) >= q.maxlen:
-        # 새 항목을 append 하면 oldest 가 evict 된다. silent fail 로 카운트.
-        _bump_silent_fail("retrieval_store_eviction_count")
-    q.append(item)
+    _ensure_slot(slot).append(item)
 
 
 def _euclidean(a: List[float], b: List[float]) -> float:

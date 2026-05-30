@@ -7,8 +7,6 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional
 
-from ..silent_fail_counters import increment as _bump_silent_fail
-
 
 _RETRIEVAL_SCORE_MIN = -2
 _RETRIEVAL_SCORE_MAX = 5
@@ -89,20 +87,6 @@ def _peer_compare(current_segment: Optional[dict],
 
 
 def build_retrieval_evidence(
-    current_segment: Optional[dict],
-    retrieved_cases: List[dict],
-    peer_latest: Optional[Dict[str, dict]] = None,
-) -> dict:
-    try:
-        return _build_retrieval_evidence_inner(
-            current_segment, retrieved_cases, peer_latest,
-        )
-    except Exception:
-        _bump_silent_fail("retrieval_evidence_skip_count")
-        return _empty_evidence()
-
-
-def _build_retrieval_evidence_inner(
     current_segment: Optional[dict],
     retrieved_cases: List[dict],
     peer_latest: Optional[Dict[str, dict]] = None,

@@ -1,7 +1,6 @@
 """AI Agent 실행 — Claude 우선, 실패 시 Mock fallback."""
 from .. import config
 from ..model.requests import MetricsRequest
-from ..silent_fail_counters import increment as _bump_silent_fail
 from .claude_api_agent import call_claude_api, build_prompt
 from .mock_agent import mock_agent_judgment
 
@@ -34,9 +33,6 @@ def run_ai_agent(metrics: MetricsRequest, pattern_result: dict, global_hw: dict)
             return result
         except Exception as e:
             print(f"  [Claude API 호출 실패] {e} — Mock 판정으로 대체합니다.")
-            # Claude 가 활성화된 상태에서 fallback 한 silent fail 만 카운트.
-            # USE_REAL_CLAUDE=False (의도된 mock) 는 silent fail 이 아니므로 제외.
-            _bump_silent_fail("claude_mock_count")
     result = mock_agent_judgment(metrics, pattern_result, global_hw)
     result["is_mock"] = True
     _normalize_hw_degradation(result)
